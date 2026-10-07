@@ -132,3 +132,46 @@ async def test_progress_throttle_event_emitted() -> None:
 
     assert throttled, "expected throttle telemetry when emit_hz is low"
     assert session.notifications[-1].progress == 2
+
+
+def _assert_monotonic(notifications: list[RecordedNotification]) -> None:
+    values = [n.progress for n in notifications]
+    assert values == sorted(values), f"progress went backwards: {values}"
+
+
+@pytest.mark.anyio
+async def test_close_during_throttled_send_does_not_regress() -> None:
+    """Closing while a throttled update is in flight must not re-send an older value."""
+    session = FakeSession()
+    closes: list[ProgressCloseEvent] = []
+    telemetry = ProgressTelemetry(on_close=lambda evt: closes.append(evt))
+
+    async with with_request_context(token="tok", session=session):
+        async with progress(total=4, telemetry=telemetry, config=ProgressConfig(emit_hz=20)) as tracker:
+            await tracker.advance(1, "one")
+            await anyio.sleep(0.005)  # first update delivered immediately
+            await tracker.set(4, message="done")  # throttled
+            await anyio.sleep(0.001)  # emitter picks it up; still in flight at close
+
+    _assert_monotonic(session.notifications)
+    assert session.notifications[-1].progress == 4
+    assert closes
+    assert closes[-1].final_progress == 4
+    assert closes[-1].final_message == "done"
+
+
+@pytest.mark.anyio
+async def test_advance_uses_in_flight_state_as_base() -> None:
+    """``advance`` must build on an update that is in flight, not the last delivered one."""
+    session = FakeSession()
+
+    async with with_request_context(token="tok", session=session):
+        async with progress(total=10, config=ProgressConfig(emit_hz=20)) as tracker:
+            await tracker.advance(1)
+            await anyio.sleep(0.005)  # first update delivered immediately
+            await tracker.set(3)  # throttled
+            await anyio.sleep(0.001)  # emitter picks it up and waits out the throttle
+            assert await tracker.advance(1) == 4
+
+    _assert_monotonic(session.notifications)
+    assert session.notifications[-1].progress == 4
